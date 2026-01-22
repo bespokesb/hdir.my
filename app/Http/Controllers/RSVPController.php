@@ -11,6 +11,8 @@ use Illuminate\Support\Str;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\URL;
 use App\Services\ToyyibpayService;
+use App\Services\SecurepayService;
+use Illuminate\Support\Facades\Log;
 use App\Models\Profile;
 use Illuminate\Support\Facades\Response;
 use SimpleSoftwareIO\QrCode\Facades\QrCode;
@@ -54,7 +56,7 @@ class RSVPController extends Controller
         ]);
         $ticket->increment('sold', (int) $data['quantity']);
 
-        return redirect()->route('events.qr', [$event->slug, $attendee->id]);
+        return redirect()->route('events.qr', [$event->slug, $attendee->qr_code]);
     }
 
     public function purchase(Request $request, string $slug)
@@ -74,7 +76,9 @@ class RSVPController extends Controller
             abort(400);
         }
 
-        $total = ((float)$ticket->price) * (int)$data['quantity'];
+        $ticketTotal = ((float)$ticket->price) * (int)$data['quantity'];
+        $fee = 2.00;
+        $total = $ticketTotal + $fee;
 
         $order = Order::create([
             'event_id' => $event->id,
@@ -104,7 +108,7 @@ class RSVPController extends Controller
             return redirect()->route('events.show', $event->slug)->withErrors(['ticket' => 'Tiada tiket tersedia.']);
         }
 
-        if ($ticket->type === 'free') {
+        if ($ticket->type === 'free' || ((float)($ticket->price ?? 0)) <= 0) {
             $order = Order::create([
                 'event_id' => $event->id,
                 'ticket_id' => $ticket->id,
@@ -128,7 +132,9 @@ class RSVPController extends Controller
             return redirect()->route('events.qr', [$event->slug, $attendee->id]);
         }
 
-        $total = ((float)$ticket->price) * 1;
+        $ticketTotal = ((float)$ticket->price) * 1;
+        $fee = 2.00;
+        $total = $ticketTotal + $fee;
         $order = Order::create([
             'event_id' => $event->id,
             'ticket_id' => $ticket->id,
@@ -192,14 +198,53 @@ class RSVPController extends Controller
                 ]);
             }
             $ticket->increment('sold', $order->quantity ?? 1);
-            return redirect()->route('events.qr', [$event->slug, $attendee->id]);
+            return redirect()->route('events.qr', [$event->slug, $attendee->qr_code]);
         }
 
         $phone = preg_replace('/[^0-9]/', '', (string) ($profile->phone ?? ''));
         if (empty($phone)) {
-            return redirect()->route('profile.show')->withErrors(['phone' => 'Sila lengkapkan nombor telefon di Profil untuk pembayaran Toyyibpay.']);
+            return redirect()->route('profile.show')->withErrors(['phone' => 'Sila lengkapkan nombor telefon di Profil untuk pembayaran.']);
         }
 
+        // SecurePay Integration
+        $svc = new SecurepayService();
+        $returnUrl = route('payments.securepay.return', $order->id);
+        $callbackUrl = route('payments.securepay.callback', $order->id);
+
+        $payload = [
+            'buyer_email' => $order->buyer_email,
+            'buyer_name' => $order->buyer_name,
+            'client_ip' => $request->ip(),
+            'order_number' => (string) $order->id,
+            'product_description' => mb_substr(strip_tags($event->title . ' - ' . $ticket->name), 0, 100),
+            'transaction_amount' => number_format($order->total_amount, 2, '.', ''),
+            'callback_url' => $callbackUrl,
+            'redirect_url' => $returnUrl,
+            'buyer_phone' => $phone,
+        ];
+
+        try {
+            $paymentData = $svc->createPayment($payload);
+            
+            // Handle HTML content (form redirect)
+            if (isset($paymentData['html'])) {
+                return response($paymentData['html']);
+            }
+
+            $payUrl = $paymentData['payment_url'] ?? $paymentData['url'] ?? null;
+            
+            if (!$payUrl) {
+                Log::error('SecurePay response missing payment URL', ['response' => $paymentData]);
+                return back()->withErrors(['payment' => 'Gagal memulakan pembayaran (URL tidak sah).']);
+            }
+
+            return redirect()->away($payUrl);
+        } catch (\Exception $e) {
+            Log::error('SecurePay Error: ' . $e->getMessage());
+            return back()->withErrors(['payment' => 'Ralat sistem pembayaran: ' . $e->getMessage()]);
+        }
+
+        /* ToyyibPay Implementation (Deprecated as Default)
         $svc = new ToyyibpayService();
         $returnUrl = route('payments.toyyib.return', $order->id);
         $callbackUrl = route('payments.toyyib.callback', $order->id);
@@ -231,7 +276,82 @@ class RSVPController extends Controller
         $payUrl = rtrim($svc->baseUrl(), '/').'/'.$billCode;
 
         return redirect()->away($payUrl);
+        */
     }
+
+    public function securepayReturn(Request $request, int $orderId)
+    {
+        $order = Order::findOrFail($orderId);
+        // SecurePay return params usually include:
+        // payment_status=true/false
+        // transaction_id
+        // order_number
+        
+        // Log params for debugging
+        Log::info('SecurePay Return Params', $request->all());
+
+        $status = $request->input('payment_status');
+        $txnId = $request->input('transaction_id');
+
+        if ($status === 'true' || $status === '1' || $status === true) {
+            $order->status = 'paid';
+            if ($txnId) {
+                $order->payment_reference = $txnId;
+            }
+            $order->save();
+
+            $attendee = Attendee::where('order_id', $order->id)->first();
+            if (!$attendee) {
+                $attendee = Attendee::create([
+                    'order_id' => $order->id,
+                    'event_id' => $order->event_id,
+                    'ticket_id' => $order->ticket_id,
+                    'name' => $order->buyer_name,
+                    'email' => $order->buyer_email,
+                    'qr_code' => Str::uuid()->toString(),
+                ]);
+            }
+            $ticket = Ticket::findOrFail($order->ticket_id);
+            $ticket->increment('sold', $order->quantity ?? 1);
+            $event = Event::findOrFail($order->event_id);
+            return redirect()->route('events.qr', [$event->slug, $attendee->qr_code]);
+        }
+
+        return redirect()->route('orders.checkout', $order->id)->withErrors(['payment' => 'Pembayaran gagal atau dibatalkan.']);
+    }
+
+    public function securepayCallback(Request $request, int $orderId)
+    {
+        Log::info('SecurePay Callback', $request->all());
+        
+        $order = Order::findOrFail($orderId);
+        $status = $request->input('payment_status');
+        $txnId = $request->input('transaction_id');
+
+        if ($status === 'true' || $status === '1' || $status === true) {
+            if ($order->status !== 'paid') {
+                $order->status = 'paid';
+                $order->payment_reference = $txnId;
+                $order->save();
+            }
+
+            // Ensure attendee exists
+            $attendee = Attendee::where('order_id', $order->id)->first();
+            if (!$attendee) {
+                Attendee::create([
+                    'order_id' => $order->id,
+                    'event_id' => $order->event_id,
+                    'ticket_id' => $order->ticket_id,
+                    'name' => $order->buyer_name,
+                    'email' => $order->buyer_email,
+                    'qr_code' => Str::uuid()->toString(),
+                ]);
+            }
+        }
+        
+        return response('OK');
+    }
+
 
     public function toyyibReturn(Request $request, int $orderId)
     {
@@ -261,7 +381,7 @@ class RSVPController extends Controller
             $ticket = Ticket::findOrFail($order->ticket_id);
             $ticket->increment('sold', $order->quantity ?? 1);
             $event = Event::findOrFail($order->event_id);
-            return redirect()->route('events.qr', [$event->slug, $attendee->id]);
+            return redirect()->route('events.qr', [$event->slug, $attendee->qr_code]);
         }
 
         // Gagal atau dibatalkan → kembali ke checkout
@@ -289,21 +409,28 @@ class RSVPController extends Controller
             return redirect()->guest('/login');
         }
         $order = Order::findOrFail($orderId);
-        $attendee = Attendee::where('order_id', $order->id)->firstOrFail();
-        $url = route('checkin.show', $attendee->qr_code);
-        try {
-            $png = QrCode::format('png')->size(360)->margin(1)->generate($url);
-            return Response::make($png, 200, [
-                'Content-Type' => 'image/png',
-                'Content-Disposition' => 'attachment; filename="qr-'.$attendee->id.'.png"'
-            ]);
-        } catch (\Throwable $e) {
-            $svg = QrCode::format('svg')->size(360)->margin(1)->generate($url);
-            return Response::make($svg, 200, [
-                'Content-Type' => 'image/svg+xml',
-                'Content-Disposition' => 'attachment; filename="qr-'.$attendee->id.'.svg"'
+
+        // Ensure attendee exists if order is paid
+        $attendee = Attendee::where('order_id', $order->id)->first();
+        if (!$attendee && $order->status === 'paid') {
+             $attendee = Attendee::create([
+                'order_id' => $order->id,
+                'event_id' => $order->event_id,
+                'ticket_id' => $order->ticket_id,
+                'name' => $order->buyer_name,
+                'email' => $order->buyer_email,
+                'qr_code' => Str::uuid()->toString(),
             ]);
         }
+        
+        if (!$attendee) {
+            abort(404, 'Tiket tidak dijumpai.');
+        }
+
+        $event = Event::findOrFail($order->event_id);
+        
+        // Redirect to QR view page instead of downloading
+        return redirect()->route('events.qr', [$event->slug, $attendee->qr_code]);
     }
 
     public function cancel(Request $request, int $orderId)
