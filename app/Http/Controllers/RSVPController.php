@@ -56,7 +56,7 @@ class RSVPController extends Controller
         ]);
         $ticket->increment('sold', (int) $data['quantity']);
 
-        return redirect()->route('events.qr', [$event->slug, $attendee->qr_code]);
+        return redirect()->route('orders.qr.download', $order->id);
     }
 
     public function purchase(Request $request, string $slug)
@@ -129,7 +129,7 @@ class RSVPController extends Controller
             ]);
             $ticket->increment('sold', 1);
 
-            return redirect()->route('events.qr', [$event->slug, $attendee->id]);
+            return redirect()->route('orders.qr.download', $order->id);
         }
 
         $ticketTotal = ((float)$ticket->price) * 1;
@@ -198,7 +198,7 @@ class RSVPController extends Controller
                 ]);
             }
             $ticket->increment('sold', $order->quantity ?? 1);
-            return redirect()->route('events.qr', [$event->slug, $attendee->qr_code]);
+            return redirect()->route('orders.qr.download', $order->id);
         }
 
         $phone = preg_replace('/[^0-9]/', '', (string) ($profile->phone ?? ''));
@@ -314,7 +314,7 @@ class RSVPController extends Controller
             $ticket = Ticket::findOrFail($order->ticket_id);
             $ticket->increment('sold', $order->quantity ?? 1);
             $event = Event::findOrFail($order->event_id);
-            return redirect()->route('events.qr', [$event->slug, $attendee->qr_code]);
+            return redirect()->route('orders.qr.download', $order->id);
         }
 
         return redirect()->route('orders.checkout', $order->id)->withErrors(['payment' => 'Pembayaran gagal atau dibatalkan.']);
@@ -381,7 +381,7 @@ class RSVPController extends Controller
             $ticket = Ticket::findOrFail($order->ticket_id);
             $ticket->increment('sold', $order->quantity ?? 1);
             $event = Event::findOrFail($order->event_id);
-            return redirect()->route('events.qr', [$event->slug, $attendee->qr_code]);
+            return redirect()->route('orders.qr.download', $order->id);
         }
 
         // Gagal atau dibatalkan → kembali ke checkout
@@ -429,8 +429,8 @@ class RSVPController extends Controller
 
         $event = Event::findOrFail($order->event_id);
         
-        // Redirect to QR view page instead of downloading
-        return redirect()->route('events.qr', [$event->slug, $attendee->qr_code]);
+        // Return view directly
+        return view('events.qr', compact('event', 'attendee'));
     }
 
     public function cancel(Request $request, int $orderId)
